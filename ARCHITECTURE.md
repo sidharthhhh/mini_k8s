@@ -2,7 +2,13 @@
 
 ## System Overview
 
-The system mimics Kubernetes' decoupled architecture. Components communicate via API Server, never directly accessing the database.
+This project simulates a production-grade Kubernetes Control Plane. It aims to capture the *behavior* and *internal mechanics* of Kubernetes using Python-native technologies (FastAPI, SQLAlchemy, Redis).
+
+**Key Design Principles:**
+1.  **Hub-and-Spoke Topology**: All components communicate *only* via the API Server.
+2.  **Event-Driven & Level-Triggered**: Components react to state changes (Events) but essentially reconcile towards a desired state (Level-Triggered).
+3.  **Optimistic Concurrency**: No global locks. Use `resourceVersion` and CAS (Compare-And-Swap) logic.
+4.  **High Availability Ready**: Designed so components (Scheduler, Controllers) can have multiple replicas with Leader Election.
 
 ```mermaid
 graph TD
@@ -11,96 +17,99 @@ graph TD
     
     %% Core Components
     subgraph Control_Plane [Control Plane]
-        API["API Server <br/>(FastAPI)"]
-        Sched["Scheduler Service <br/>(gRPC)"]
-        CM["Controller Manager <br/>(gRPC)"]
+        API["API Server Group (FastAPI) <br/> Auth, Validation, OCC"]
+        
+        subgraph Sched_Group [Scheduler Cluster]
+            Sched1["Scheduler 1 <br/> (Leader)"]
+            Sched2["Scheduler 2 <br/> (Standby)"]
+        end
+        
+        subgraph CM_Group [Controller Manager Cluster]
+            CM1["ReplicaSet Controller <br/> (Leader)"]
+            CM2["Deployment Controller <br/> (Standby)"]
+        end
     end
 
     %% Data Store Simulation
     subgraph Data_Store [Etcd Simulation]
-        PG[("PostgreSQL <br/> Durable State")]
-        Redis[("Redis Streams <br/> Event Bus")]
+        PG[("PostgreSQL <br/> Durable Key-Value Store")]
+        Redis[("Redis <br/> 1. Pub/Sub (Watch) <br/> 2. Dist. Lock (Leases)")]
     end
 
     %% Worker Nodes
     subgraph Worker_Nodes [Data Plane]
-        Node1["Node Agent 1 <br/> (Kubelet Clone)"]
-        Node2["Node Agent 2 <br/> (Kubelet Clone)"]
-        Docker1[Docker Engine]
-        Docker2[Docker Engine]
+        Node1["Node Agent 1"]
+        Node2["Node Agent 2"]
     end
 
-    %% Data Flows
-    %% 1. Submission
-    User -- "1. POST /pods (Desired State)" --> API
+    %% Interactions
+    User -->|REST / HTTP2| API
     
-    %% 2. Persistence & Events
-    API -- "2. INSERT Pod (Pending)" --> PG
-    API -- "3. Publish Event (ADDED)" --> Redis
+    %% Storage
+    API -->|SQL (ACID)| PG
+    API -->|Publish Events| Redis
     
-    %% 3. Watch Mechanism
-    Redis -.-> |"4. Stream Event (New Pod)"| Sched
-    Redis -.-> |"Stream Event"| CM
-    Redis -.-> |"Stream Event"| Node1
+    %% Watch & Cache (The "Informer" Pattern)
+    Redis -.-> |Stream Events| Sched1
+    Redis -.-> |Stream Events| CM1
+    Redis -.-> |Stream Events| Node1
     
-    %% 4. Scheduling Logic
-    Sched -- "5. Bind Pod to Node1" --> API
-    API -- "6. UPDATE Pod (nodeName=Node1)" --> PG
-    API -- "7. Publish Event (MODIFIED)" --> Redis
+    %% Leader Election
+    Sched1 -.-> |Acquire Lock| Redis
+    Sched2 -.-> |Check Lock| Redis
+    
+    %% Control Loops
+    Sched1 --> |gRPC: Bind Pod| API
+    CM1 --> |gRPC: Update Status| API
+    Node1 --> |Heartbeat / Status| API
 
-    %% 5. Node Execution
-    Redis -.-> |"8. Watch (Pod Assigned)"| Node1
-    Node1 -- "9. Start Container" --> Docker1
-    Node1 -- "10. Update Status (Running)" --> API
-    
-    %% 6. Reconciliation (Background)
-    CM -- "Loop: Check Desired vs Actual" --> API
-    
     %% Styling
     classDef component fill:#326ce5,stroke:#fff,stroke-width:2px,color:white;
     classDef db fill:#ff9900,stroke:#333,stroke-width:2px;
     classDef worker fill:#28a745,stroke:#fff,stroke-width:2px,color:white;
     
-    class API,Sched,CM component;
+    class API,Sched1,Sched2,CM1,CM2 component;
     class PG,Redis db;
     class Node1,Node2 worker;
 ```
 
-## Key Components
+## detailed Component Breakthrough
 
-### 1. API Server (FastAPI)
-- **Role**: Central management point. Only component that talks to DB.
-- **Responsibility**: Authenticates requests, validates data, persists to Postgres, emits events to Redis.
-- **Tech**: Python FastAPI, SQLAlchemy (Async), Redis-py.
+### 1. API Server (The Brain)
+-   **Tech**: FastAPI (Async), Uvicorn.
+-   **State Management (Postgres)**:
+    -   All objects have `kind`, `metadata` (name, uid, **resourceVersion**), `spec`, and `status`.
+    -   **Optimistic Locking**: Updates *must* match the current `resourceVersion`. If DB version > Request version -> `409 Conflict`.
+-   **Event System (Redis Streams)**:
+    -   On successful DB write, API publishes `(Type, Object)` event to Redis Stream `k8s_events`.
+-   **Watch Endpoint**:
+    -   `GET /api/v1/watch/pods` -> Upgrades connection (SSE or Chunked) -> Subscribes to Redis -> Stream updates to client.
 
-### 2. Etcd Simulation (Postgres + Redis)
-- **Why?**: Real etcd is key-value with watch. We simulate this:
-    - **Postgres**: Durable storage and strong consistency.
-    - **Redis Streams**: "Watch" mechanism. When data changes in PG, API pushes an event to Redis. Clients "watch" via API, which streams from Redis.
+### 2. Scheduler & Controllers (The Logic)
+These components use the **Informer Pattern** to avoid hammering the DB.
 
-### 3. Scheduler (gRPC + Python)
-- **Role**: Assigns unscheduled pods to nodes.
-- **Workflow**: 
-    1. Watches for Pods with `spec.nodeName` is Empty.
-    2. Filters feasible nodes.
-    3. Scores nodes.
-    4. Calls `Bind` API on API Server.
+-   **Informer / Local Cache**:
+    1.  **List**: At startup, fetch *all* objects of interest from API.
+    2.  **Watch**: Open a long-lived stream from `latest_resource_version`.
+    3.  **Cache**: update local dictionary/store based on events.
+    4.  **Reconcile**: Business logic reads from *Local Cache* (fast) but writes to *API Server* (safe).
 
-### 4. Controller Manager (gRPC + Python)
-- **Role**: Reconciles state (Desired vs Actual).
-- **Loop**:
-    1. Watch for changes (e.g., Deployment created).
-    2. Check current state (Count Pods).
-    3. Take action (Create/Delete Pods).
+-   **Leader Election**:
+    -   Mechanism: `Lease` object (or Redis Lock with TTL).
+    -   Loop: Attempt to acquire lock every 5s. If `leader` exists and is healthy, become `Standby`. If `leader` lease expires, acquire and become `Active`.
 
-## Data Flow: Pod Creation
+### 3. Node Agent (Kubelet Simulator)
+-   **Registration**: POST /api/v1/nodes on startup.
+-   **Heartbeat**: PUT /api/v1/nodes/status every 10s (Lease renewal).
+-   **Pod Loop**:
+    -   Watch Pods where `spec.nodeName == MyNodeID`.
+    -   Compare `spec` vs running containers.
+    -   Create/Kill Docker containers accordingly.
+    -   Update `pod.status.phase` (Pending -> Running).
 
-1. **User** POSTs Pod to `/api/v1/pods`.
-2. **API Server** validates payload (Pydantic).
-3. **API Server** saves to **Postgres** (Status = `Pending`).
-4. **API Server** publishes `ADDED` event to **Redis**.
-5. **Scheduler** (watching Redis) sees `ADDED` Pod.
-6. **Scheduler** calculates best Node.
-7. **Scheduler** calls API `PATCH /pods/<id>` to set `nodeName`.
-8. **Node Agent** (watching for Pods on its Node) sees update.
-9. **Node Agent** starts container (simulated) and updates Pod Status to `Running`.
+## Scalability & Reliability Features implemented
+
+1.  **Resource Versioning & Optimistic Locking**: Prevents "Lost Updates" when multiple controllers try to update the same object.
+2.  **Leader Election**: Ensures we can run high-availability control planes without split-brain scheduling.
+3.  **Level-Triggered Reconciliation**: Even if an event is missed, the periodic "Resync" loop ensures the state eventually matches.
+4.  **Rate Limiting**: API Server protects itself from "Retry Storms" using token buckets.

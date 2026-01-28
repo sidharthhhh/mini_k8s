@@ -7,35 +7,44 @@ Build a production-style Kubernetes Control Plane Simulator in Python to master 
 
 ### Phase 1: API Server (The Brain)
 - [ ] **Core Setup**: FastAPI project structure, Pydantic models for Pod/Node/Deployment.
-- [ ] **Data Store**: Postgres for persistence (simulating etcd).
-- [ ] **REST APIs**: CRUD endpoints for `/api/v1/pods`, `/api/v1/nodes`.
-- [ ] **Concurrency**: Optimistic locking (`resourceVersion`) and atomic updates.
+- [ ] **Data Store**: Postgres for persistence with `resourceVersion` column.
+- [ ] **Optimistic Locking**: Implement CAS (Compare-And-Swap) logic in DB updates.
+- [ ] **REST APIs**: CRUD endpoints with version checks (`409 Conflict` on mismatch).
+- [ ] **Rate Limiting**: Add simple middleware to throttle requests.
 - [ ] **Authentication**: JWT middleware.
 - [ ] **Dockerization**: Dockerfile and docker-compose for API Server + Postgres.
 
 ### Phase 2: Internal Event Bus (The Nervous System)
 - [ ] **Watch Mechanism**: Redis Streams implementation.
-- [ ] **API Watch endpoint**: `/api/v1/watch/...` using SSE or streaming response.
-- [ ] **Event Emitting**: API server publishes events on CRUD.
+- [ ] **Event Publisher**: Hook into CRUD operations to publish generic `(Action, Kind, Body)` events.
+- [ ] **Watch Endpoint**: `/api/v1/watch/...` streaming response (SSE).
 
 ### Phase 3: Scheduler (The Decider)
-- [ ] **gRPC Setup**: Define Protobufs for scheduling.
-- [ ] **Watch Pending**: Scheduler watches API server for `Pending` pods.
-- [ ] **Scheduling Algorithms**: Round-robin, Bin-packing (CPU/Memory).
-- [ ] **Binding**: Call API Server to bind Pod to Node.
+- [ ] **Leader Election**: Implement Redis-based locking/lease sidecar.
+- [ ] **Informer Pattern**: Build a generic `SharedInformer` class that:
+    -   Lists all objects initially.
+    -   Watches for updates.
+    -   Maintains a local in-memory cache.
+- [ ] **Scheduling Logic**: Read from Local Cache (Informer), Write to API Server.
+- [ ] **Algorithms**: Round-robin, Bin-packing (CPU/Memory).
 
 ### Phase 4: Controller Manager (The State Enforcer)
-- [ ] **ReplicaSet Controller**: Ensure `replicas` count matches desired state.
-- [ ] **Reconciliation Loop**: Periodic check + Event watcher.
-- [ ] **Deployment Controller**: Rolling updates simulation.
+- [ ] **ReplicaSet Controller**: Use Informer to count Pods vs ReplicaSet spec.
+- [ ] **Deployment Controller**: Implement Rolling Update logic.
+- [ ] **Reconciliation**: Periodic loop (Resync) ensuring cache consistency.
 
 ### Phase 5: Node Agent (The Worker)
-- [ ] **Heartbeats**: Report node status to API Server.
+- [ ] **Heartbeats**: Report node status / Leases.
 - [ ] **Pod Lifecycle**: Simulate pulling images, starting containers (state transitions).
 
 ### Phase 6: Chaos & Resilience
 - [ ] **Failure Injection**: Kill components, network partitions.
 - [ ] **Testing**: Verify system recovery.
+
+### Phase 7: Scalability Experimentation
+- [ ] **Load Testing**: Use Locust or K6 to hammer the API Server.
+- [ ] **Metrics**: Expose Prometheus metrics (/metrics) from all components.
+- [ ] **Performance Tuning**: Adjust Rate Limits, Connection Pools.
 
 ---
 
