@@ -43,25 +43,25 @@ graph TD
     end
 
     %% Interactions
-    User -->|REST / HTTP2| API
+    User -->|"REST / HTTP2"| API
     
     %% Storage
-    API -->|SQL (ACID)| PG
-    API -->|Publish Events| Redis
+    API -->|"SQL (ACID)"| PG
+    API -->|"Publish Events"| Redis
     
     %% Watch & Cache (The "Informer" Pattern)
-    Redis -.-> |Stream Events| Sched1
-    Redis -.-> |Stream Events| CM1
-    Redis -.-> |Stream Events| Node1
+    Redis -.-> |"Stream Events"| Sched1
+    Redis -.-> |"Stream Events"| CM1
+    Redis -.-> |"Stream Events"| Node1
     
     %% Leader Election
-    Sched1 -.-> |Acquire Lock| Redis
-    Sched2 -.-> |Check Lock| Redis
+    Sched1 -.-> |"Acquire Lock"| Redis
+    Sched2 -.-> |"Check Lock"| Redis
     
     %% Control Loops
-    Sched1 --> |gRPC: Bind Pod| API
-    CM1 --> |gRPC: Update Status| API
-    Node1 --> |Heartbeat / Status| API
+    Sched1 --> |"gRPC: Bind Pod"| API
+    CM1 --> |"gRPC: Update Status"| API
+    Node1 --> |"Heartbeat / Status"| API
 
     %% Styling
     classDef component fill:#326ce5,stroke:#fff,stroke-width:2px,color:white;
