@@ -11,21 +11,21 @@ graph TD
     
     %% Core Components
     subgraph Control_Plane [Control Plane]
-        API[API Server <br/>(FastAPI)]
-        Sched[Scheduler Service <br/>(gRPC)]
-        CM[Controller Manager <br/>(gRPC)]
+        API["API Server <br/>(FastAPI)"]
+        Sched["Scheduler Service <br/>(gRPC)"]
+        CM["Controller Manager <br/>(gRPC)"]
     end
 
     %% Data Store Simulation
     subgraph Data_Store [Etcd Simulation]
-        PG[(PostgreSQL <br/> Durable State)]
-        Redis[(Redis Streams <br/> Event Bus)]
+        PG[("PostgreSQL <br/> Durable State")]
+        Redis[("Redis Streams <br/> Event Bus")]
     end
 
     %% Worker Nodes
     subgraph Worker_Nodes [Data Plane]
-        Node1[Node Agent 1 <br/> (Kubelet Clone)]
-        Node2[Node Agent 2 <br/> (Kubelet Clone)]
+        Node1["Node Agent 1 <br/> (Kubelet Clone)"]
+        Node2["Node Agent 2 <br/> (Kubelet Clone)"]
         Docker1[Docker Engine]
         Docker2[Docker Engine]
     end
