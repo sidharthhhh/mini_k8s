@@ -1,115 +1,324 @@
-# Architecture Design
+# Architecture Design — Go + Python Hybrid
 
 ## System Overview
 
-This project simulates a production-grade Kubernetes Control Plane. It aims to capture the *behavior* and *internal mechanics* of Kubernetes using Python-native technologies (FastAPI, SQLAlchemy, Redis).
+This project simulates a **production-grade Kubernetes Control Plane** using a **Go + Python hybrid** architecture. Go owns the critical control plane path (performance, concurrency, correctness). Python owns tooling, scripting, and human-facing layers.
 
-**Key Design Principles:**
-1.  **Hub-and-Spoke Topology**: All components communicate *only* via the API Server.
-2.  **Event-Driven & Level-Triggered**: Components react to state changes (Events) but essentially reconcile towards a desired state (Level-Triggered).
-3.  **Optimistic Concurrency**: No global locks. Use `resourceVersion` and CAS (Compare-And-Swap) logic.
-4.  **High Availability Ready**: Designed so components (Scheduler, Controllers) can have multiple replicas with Leader Election.
+**Core Design Principles:**
+1. **Hub-and-Spoke Topology**: All components communicate *only* via the API Server.
+2. **Event-Driven & Level-Triggered**: Components react to state changes but reconcile towards desired state.
+3. **Optimistic Concurrency**: No global locks — use `resourceVersion` and Compare-And-Swap.
+4. **High Availability Ready**: HA-capable via Redis-based Leader Election on Scheduler and Controllers.
+5. **Language Separation**: Go = control plane runtime. Python = operator tooling layer.
+
+---
+
+## Component Language Map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  GO (Control Plane)                                             │
+│  ┌──────────────┐  ┌─────────────┐  ┌──────────────────────┐  │
+│  │  API Server   │  │  Scheduler  │  │  Controller Manager  │  │
+│  │  (chi/net http)│  │  (gRPC cli) │  │  (goroutine loops)   │  │
+│  └──────┬───────┘  └──────┬──────┘  └──────────┬───────────┘  │
+│         │                  │                     │              │
+│  ┌──────┴──────────────────┴─────────────────────┴──────────┐  │
+│  │              Node Agent / Kubelet Sim (Go)                │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  PYTHON (Operator / Tooling Layer)                              │
+│  ┌──────────────────┐   ┌──────────────────────────────────┐   │
+│  │  kubectl-mini CLI │   │  Chaos Injector + Observability  │   │
+│  │  (Typer + httpx)  │   │  (asyncio + FastAPI + WebSocket) │   │
+│  └──────────────────┘   └──────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## System Diagram
 
 ```mermaid
 graph TD
     %% Actors
-    User((User / Kubectl))
-    
-    %% Core Components
-    subgraph Control_Plane [Control Plane]
-        API["API Server Group (FastAPI) <br/> Auth, Validation, OCC"]
-        
-        subgraph Sched_Group [Scheduler Cluster]
-            Sched1["Scheduler 1 <br/> (Leader)"]
-            Sched2["Scheduler 2 <br/> (Standby)"]
+    User((User / kubectl-mini))
+    Chaos((Chaos Injector))
+
+    %% Core Components (Go)
+    subgraph Control_Plane ["Control Plane (Go)"]
+        API["API Server (Go/chi)<br/>Auth · Validation · OCC · SSE Watch"]
+
+        subgraph Sched_Group ["Scheduler Cluster"]
+            Sched1["Scheduler 1<br/>(Leader — gRPC client)"]
+            Sched2["Scheduler 2<br/>(Standby)"]
         end
-        
-        subgraph CM_Group [Controller Manager Cluster]
-            CM1["ReplicaSet Controller <br/> (Leader)"]
-            CM2["Deployment Controller <br/> (Standby)"]
+
+        subgraph CM_Group ["Controller Manager Cluster"]
+            CM1["ReplicaSet Controller<br/>(Leader)"]
+            CM2["Deployment Controller<br/>(Standby)"]
         end
     end
 
-    %% Data Store Simulation
-    subgraph Data_Store [Etcd Simulation]
-        PG[("PostgreSQL <br/> Durable Key-Value Store")]
-        Redis[("Redis <br/> 1. Pub/Sub (Watch) <br/> 2. Dist. Lock (Leases)")]
+    %% Data Stores
+    subgraph Data_Store ["Etcd Simulation"]
+        PG[("PostgreSQL<br/>Durable State Store")]
+        Redis[("Redis<br/>Streams · Pub/Sub · Dist. Locks")]
     end
 
-    %% Worker Nodes
-    subgraph Worker_Nodes [Data Plane]
-        Node1["Node Agent 1"]
-        Node2["Node Agent 2"]
+    %% Worker Nodes (Go)
+    subgraph DataPlane ["Data Plane (Go)"]
+        Node1["Node Agent 1<br/>(Kubelet Sim)"]
+        Node2["Node Agent 2<br/>(Kubelet Sim)"]
     end
 
-    %% Interactions
-    User -->|"REST / HTTP2"| API
-    
+    %% Python Tooling Layer
+    subgraph Python_Layer ["Tooling Layer (Python)"]
+        CLI["kubectl-mini CLI<br/>(Typer + httpx)"]
+        Obs["Observability Sidecar<br/>(FastAPI + WebSocket)"]
+        ChaosEng["Chaos Injector<br/>(asyncio + httpx)"]
+    end
+
+    %% User flows
+    User --> CLI
+    CLI -->|"REST (HTTP/1.1)"| API
+    Chaos --> ChaosEng
+    ChaosEng -->|"REST calls"| API
+
     %% Storage
-    API -->|"SQL (ACID)"| PG
-    API -->|"Publish Events"| Redis
-    
-    %% Watch & Cache (The "Informer" Pattern)
-    Redis -.-> |"Stream Events"| Sched1
-    Redis -.-> |"Stream Events"| CM1
-    Redis -.-> |"Stream Events"| Node1
-    
+    API -->|"SQL (ACID) via pgx"| PG
+    API -->|"Publish to Redis Stream"| Redis
+
+    %% Watch Channel (SSE over HTTP)
+    Redis -..->|"Stream Events"| Sched1
+    Redis -..->|"Stream Events"| CM1
+    Redis -..->|"Stream Events"| Node1
+
     %% Leader Election
-    Sched1 -.-> |"Acquire Lock"| Redis
-    Sched2 -.-> |"Check Lock"| Redis
-    
-    %% Control Loops
-    Sched1 --> |"gRPC: Bind Pod"| API
-    CM1 --> |"gRPC: Update Status"| API
-    Node1 --> |"Heartbeat / Status"| API
+    Sched1 -..->|"SETNX Lock (TTL)"| Redis
+    Sched2 -..->|"Check Lock"| Redis
+    CM1 -..->|"SETNX Lock (TTL)"| Redis
+
+    %% Control loops write back to API
+    Sched1 -->|"gRPC: BindPod"| API
+    CM1 -->|"gRPC: UpdateStatus"| API
+    Node1 -->|"Heartbeat + Pod Status"| API
+
+    %% Observability reads from Redis
+    Redis -..->|"Events stream"| Obs
 
     %% Styling
-    classDef component fill:#326ce5,stroke:#fff,stroke-width:2px,color:white;
+    classDef goComp fill:#00add8,stroke:#fff,stroke-width:2px,color:white;
+    classDef pyComp fill:#3572a5,stroke:#fff,stroke-width:2px,color:white;
     classDef db fill:#ff9900,stroke:#333,stroke-width:2px;
     classDef worker fill:#28a745,stroke:#fff,stroke-width:2px,color:white;
-    
-    class API,Sched1,Sched2,CM1,CM2 component;
+
+    class API,Sched1,Sched2,CM1,CM2 goComp;
+    class CLI,Obs,ChaosEng pyComp;
     class PG,Redis db;
     class Node1,Node2 worker;
 ```
 
-## detailed Component Breakthrough
+---
 
-### 1. API Server (The Brain)
--   **Tech**: FastAPI (Async), Uvicorn.
--   **State Management (Postgres)**:
-    -   All objects have `kind`, `metadata` (name, uid, **resourceVersion**), `spec`, and `status`.
-    -   **Optimistic Locking**: Updates *must* match the current `resourceVersion`. If DB version > Request version -> `409 Conflict`.
--   **Event System (Redis Streams)**:
-    -   On successful DB write, API publishes `(Type, Object)` event to Redis Stream `k8s_events`.
--   **Watch Endpoint**:
-    -   `GET /api/v1/watch/pods` -> Upgrades connection (SSE or Chunked) -> Subscribes to Redis -> Stream updates to client.
+## Detailed Component Breakdown
 
-### 2. Scheduler & Controllers (The Logic)
-These components use the **Informer Pattern** to avoid hammering the DB.
+### 1. API Server — Go
 
--   **Informer / Local Cache**:
-    1.  **List**: At startup, fetch *all* objects of interest from API.
-    2.  **Watch**: Open a long-lived stream from `latest_resource_version`.
-    3.  **Cache**: update local dictionary/store based on events.
-    4.  **Reconcile**: Business logic reads from *Local Cache* (fast) but writes to *API Server* (safe).
+**Stack**: Go + `chi` router + `pgx` (Postgres) + `go-redis` + `golang-jwt/jwt`
 
--   **Leader Election**:
-    -   Mechanism: `Lease` object (or Redis Lock with TTL).
-    -   Loop: Attempt to acquire lock every 5s. If `leader` exists and is healthy, become `Standby`. If `leader` lease expires, acquire and become `Active`.
+**Responsibilities:**
+- Accept REST requests from `kubectl-mini` (Python CLI) and controllers.
+- Validate, authenticate (JWT), and persist resources to Postgres.
+- Publish `(EventType, Object)` to Redis Stream `k8s:events` on every write.
+- Expose `GET /api/v1/watch/{resource}` — long-lived SSE endpoint backed by Redis consumer groups.
+- Expose `gRPC` server for `BindPod` and `UpdateStatus` calls from Scheduler/Controllers.
 
-### 3. Node Agent (Kubelet Simulator)
--   **Registration**: POST /api/v1/nodes on startup.
--   **Heartbeat**: PUT /api/v1/nodes/status every 10s (Lease renewal).
--   **Pod Loop**:
-    -   Watch Pods where `spec.nodeName == MyNodeID`.
-    -   Compare `spec` vs running containers.
-    -   Create/Kill Docker containers accordingly.
-    -   Update `pod.status.phase` (Pending -> Running).
+**Optimistic Concurrency:**
+- Every object carries `resourceVersion` (monotonic integer).
+- On `PUT`/`PATCH`, SQL `WHERE resource_version = $requested_version` → if 0 rows updated → `409 Conflict`.
 
-## Scalability & Reliability Features implemented
+**Go Patterns Used:**
+- `context.Context` threading for request cancellation.
+- Middleware chain: logging → auth → rate-limit → handler.
+- Goroutines per SSE client, cleaned up via `context.WithCancel`.
 
-1.  **Resource Versioning & Optimistic Locking**: Prevents "Lost Updates" when multiple controllers try to update the same object.
-2.  **Leader Election**: Ensures we can run high-availability control planes without split-brain scheduling.
-3.  **Level-Triggered Reconciliation**: Even if an event is missed, the periodic "Resync" loop ensures the state eventually matches.
-4.  **Rate Limiting**: API Server protects itself from "Retry Storms" using token buckets.
+---
+
+### 2. Scheduler — Go
+
+**Stack**: Go + gRPC client + `go-redis` + Redis distributed lock
+
+**Informer Pattern:**
+1. **List**: `GET /api/v1/pods?fieldSelector=status.phase=Pending` → populate local cache.
+2. **Watch**: Subscribe to Redis Stream from `latest_resource_version`.
+3. **Cache**: `sync.RWMutex`-protected `map[string]*Pod`.
+4. **Reconcile**: Pick unscheduled pods → run scoring → gRPC `BindPod` to API Server.
+
+**Scheduling Algorithms (interface-based for easy swapping):**
+```go
+type Scheduler interface {
+    Score(pod *Pod, nodes []*Node) *Node
+}
+// Implementations: RoundRobin, BinPack
+```
+
+**Leader Election:**
+- `SETNX k8s:leader:scheduler <instanceID> EX 15` — only leader runs scheduling loop.
+- Standby instance polls every 5s.
+
+---
+
+### 3. Controller Manager — Go
+
+**Stack**: Go + goroutines + buffered channels + gRPC client
+
+**ReplicaSet Controller:**
+- Watch `ReplicaSet` and `Pod` objects.
+- If `running_count < desired_replicas` → POST new pods to API Server.
+- If `running_count > desired_replicas` → DELETE excess pods.
+
+**Work Queue Pattern:**
+```go
+workQueue := make(chan string, 100) // buffered channel — like client-go workqueue
+go func() {
+    for key := range workQueue { reconcile(key) }
+}()
+```
+
+**Resync Loop (Level-Triggered):**
+- Even without events, re-list all objects every 30s to catch missed events.
+
+---
+
+### 4. Node Agent (Kubelet Simulator) — Go
+
+**Stack**: Go + Docker SDK (`docker/docker/client`) + goroutines
+
+**Loops (all concurrent goroutines):**
+- **Registration**: one-shot POST on startup.
+- **Heartbeat**: `time.Ticker` every 10s → PUT `/api/v1/nodes/{id}/status`.
+- **Pod Watch**: SSE stream → apply pod spec → transition states.
+- **Lifecycle State Machine**: `Pending → ContainerCreating → Running → Succeeded/Failed`.
+
+**Docker Integration**: Uses Docker SDK to call `docker run`/`docker stop` for real container simulation.
+
+---
+
+### 5. kubectl-mini CLI — Python
+
+**Stack**: Python + `Typer` + `httpx` + `rich` + `PyYAML`
+
+**Commands:**
+```
+kubectl-mini get pods
+kubectl-mini get nodes
+kubectl-mini apply -f pod.yaml
+kubectl-mini describe pod <name>
+kubectl-mini get pods --watch          # SSE streaming
+kubectl-mini delete pod <name>
+```
+
+**Config file** `~/.mini-kube/config.yaml`:
+```yaml
+server: http://localhost:8080
+token: <jwt_token>
+```
+
+**Python Patterns Used**: Typer decorators, `httpx.AsyncClient`, `rich.Table`, YAML parsing, `asyncio` for `--watch`.
+
+---
+
+### 6. Chaos Injector + Observability — Python
+
+**Stack**: Python + `asyncio` + `httpx` + `FastAPI` + WebSockets + `PyYAML`
+
+**Chaos Injector:**
+- Reads a YAML scenario file:
+```yaml
+scenarios:
+  - action: kill_node
+    target: node-1
+    after: 30s
+  - action: kill_pods
+    selector: app=nginx
+    count: 3
+    after: 60s
+```
+- Executes using `asyncio.sleep` + `httpx.AsyncClient`.
+
+**Observability Sidecar (FastAPI):**
+- Subscribes to Redis Stream `k8s:events`.
+- Exposes `/ws/events` WebSocket → pushes events to any connected browser.
+- Exposes `GET /metrics` → summary stats (pod counts by phase, node counts, event rates).
+
+---
+
+## Data Flow: Pod Creation End-to-End
+
+```
+kubectl-mini apply -f pod.yaml
+        │  (Python httpx POST)
+        ▼
+API Server (Go)
+  ├── Validate & Auth (JWT middleware)
+  ├── Write to Postgres (INSERT pods ... RETURNING resource_version)
+  └── Publish to Redis Stream k8s:events
+              │
+              ├──► Scheduler (Go) receives ADDED event
+              │      └── Scores nodes → gRPC BindPod → API Server writes nodeName
+              │
+              ├──► Node Agent (Go) receives MODIFIED event (pod.spec.nodeName = "node-1")
+              │      └── docker run ... → Update pod.status.phase = Running
+              │
+              └──► Observability Sidecar (Python) streams event to dashboard WebSocket
+```
+
+---
+
+## Repository Structure
+
+```
+mini_k8s/
+├── cmd/
+│   ├── apiserver/         # Go — main.go for API Server
+│   ├── scheduler/         # Go — main.go for Scheduler
+│   ├── controller-manager/ # Go — main.go for Controller Manager
+│   └── node-agent/        # Go — main.go for Node Agent
+├── internal/
+│   ├── apiserver/         # handlers, middleware, store
+│   ├── scheduler/         # informer, algorithms, election
+│   ├── controller/        # reconcilers, workqueue
+│   └── node/              # pod lifecycle, docker client
+├── pkg/
+│   ├── types/             # shared Go structs (Pod, Node, Deployment)
+│   └── client/            # Go HTTP client for inter-component calls
+├── proto/
+│   └── scheduler.proto    # Protobuf definitions (shared Go + Python stubs)
+├── tools/
+│   ├── kubectl-mini/      # Python — Typer CLI
+│   ├── chaos/             # Python — asyncio chaos injector
+│   └── observability/     # Python — FastAPI observability sidecar
+├── deploy/
+│   ├── docker-compose.yml
+│   └── Makefile
+├── PLAN.md
+└── ARCHITECTURE.md
+```
+
+---
+
+## Key Technical Decisions
+
+| Decision | Choice | Reason |
+|---|---|---|
+| API Server language | **Go** | Performance, goroutines for SSE, idiomatic HTTP server |
+| Scheduler/CM language | **Go** | Concurrency patterns (channels, goroutines) mirror real K8s client-go |
+| CLI language | **Python** | Typer + rich = fastest path to a great CLI; teaches Python elegantly |
+| Chaos scripting | **Python** | asyncio + scripting = natural fit; Python excels at automation scripts |
+| ORM | **None (raw SQL)** | Learn SQL directly; `pgx` for Go, `asyncpg` for Python if needed |
+| gRPC transport | **Go gRPC** | Protobuf + gRPC Go is the real K8s transport mechanism |
+| Watch mechanism | **Redis Streams + SSE** | SSE is simpler than WebSockets for server→client push; Redis Streams preserve history |
+| Leader Election | **Redis SETNX + TTL** | Simulates K8s Lease objects; teaches distributed locking |
