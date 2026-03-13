@@ -137,4 +137,4 @@ Phase 7 ✅ → You know Python asyncio, FastAPI, chaos engineering
 ---
 
 ## Current Focus: Phase 1 — API Server in Go
-Start with: `go mod init`, folder structure, first `Pod` struct, Postgres connection.
+Start with: `go mod init`, folder structure, first `Pod` struct, Postgres proper connection 
